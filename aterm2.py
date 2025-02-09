@@ -5,6 +5,9 @@ from anthropic import AsyncAnthropic
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from prompt_toolkit import PromptSession
+from prompt_toolkit.patch_stdout import patch_stdout
+
 logging.basicConfig(filename='/tmp/aterm2.log', level=logging.DEBUG,
                     format='%(asctime)s %(levelname)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger()
@@ -24,7 +27,6 @@ async def claude(client, messages, tools):
             printer("llm_text_stream", text)
 
     final_message = await stream.get_final_message()
-
     return final_message.to_dict()
 
 async def tools_handle(messages, mcp_sessions):
@@ -73,44 +75,53 @@ async def llm(client, messages, tools, mcp_sessions):
     return messages
 
 async def mcp_session_start(prefix, mcp_config, exit_stack):
-    read, write = await exit_stack.enter_async_context(stdio_client(StdioServerParameters(**mcp_config)))
+    stdio = stdio_client(StdioServerParameters(**mcp_config))
+    read, write = await exit_stack.enter_async_context(stdio)
     session = await exit_stack.enter_async_context(ClientSession(read, write))
     await session.initialize()
+    tools = await session.list_tools()
 
     return session, [{
         "name": prefix + x.name,
         "description": x.description,
         "input_schema": x.inputSchema
-    } for x in (await session.list_tools()).tools]
+    } for x in tools.tools]
+
+async def query_get():
+    session = PromptSession()
+    while True:
+        with patch_stdout():
+            prompt = await session.prompt_async('> ', prompt_continuation=lambda *a, **kw: "", multiline=True)
+
+            return prompt.strip()
 
 async def app(mcp_configs):
-    client = AsyncAnthropic()
-    exit_stack = AsyncExitStack()
-    try:
-        mcp_start = await asyncio.gather(*[
-            mcp_session_start(prefix + "__", mcp_config, exit_stack) for prefix, mcp_config in mcp_configs.items()
-        ])
+    async with AsyncExitStack() as exit_stack:
+        client = await exit_stack.enter_async_context(AsyncAnthropic())
+
         tools, mcp_sessions = [], {}
-        for prefix, [session, session_tools] in zip(mcp_configs.keys(), mcp_start):
+        for prefix, mcp_config in mcp_configs.items():
+            session, session_tools = await mcp_session_start(prefix + "__", mcp_config, exit_stack)
             mcp_sessions[prefix] = session
-            for tool in session_tools:
-                tools.append(tool)
+            tools.extend(session_tools)
 
-        messages = []
-        query = "Please brave search for fdzdfj3wedsoci424242"
-        printer("query", query)
-        messages.append({"role": "user", "content": query})
-        messages = await llm(client, messages, tools, mcp_sessions)
-    except Exception as e:
-        print("WHAT?", e)
-        logger.exception("NOP")
+        try:
+            messages = []
+            while True:
+                query = await query_get()
+                messages.append({"role": "user", "content": query})
+                messages = await llm(client, messages, tools, mcp_sessions)
+                print()
+        except Exception as e:
+            print("WHAT?", e)
+            logger.exception("NOP")
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(
         description='A terminal LLM chat app with support for langchain tools and mcp servers')
     parser.add_argument('--mcp-config-file', type=str, help='Path to MCP config JSON file', required=True)
-    # parser.add_argument('--langchain-tools', type=str, action='append', help='Path to langchain tools Python file')
     args = parser.parse_args()
+
     with open(args.mcp_config_file) as f:
         mcp_configs = json.load(f)["mcpServers"]
         for mcp_config in mcp_configs.values():
@@ -126,3 +137,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(e)
         logger.exception("ERROR")
+
+if __name__ == "__main__":
+    main()
