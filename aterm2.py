@@ -25,9 +25,8 @@ async def claude(client, messages, tools):
                                       tools=tools, system=SYSTEM) as stream:
         async for text in stream.text_stream:
             printer("llm_text_stream", text)
-
-    final_message = await stream.get_final_message()
-    return final_message.to_dict()
+        final_message = await stream.get_final_message()
+        return final_message.to_dict()
 
 async def tools_handle(messages, mcp_sessions):
     for item in messages[-1]["content"]:
@@ -47,6 +46,7 @@ async def tools_handle(messages, mcp_sessions):
                     }],
                 })
                 break
+            
             session = mcp_sessions[item["name"].split("__")[0]]
             result = await session.call_tool(item["name"].split("__")[-1], item["input"])
             result_text = "".join([x.text for x in result.content])
@@ -61,7 +61,6 @@ async def tools_handle(messages, mcp_sessions):
                     "content": result_text,
                 }],
             })
-
     return messages
 
 async def llm(client, messages, tools, mcp_sessions):
@@ -71,39 +70,53 @@ async def llm(client, messages, tools, mcp_sessions):
         messages = await tools_handle(messages, mcp_sessions)
         if final_message["stop_reason"] != "tool_use":
             break
-
     return messages
 
 async def mcp_session_start(prefix, mcp_config, exit_stack):
-    stdio = stdio_client(StdioServerParameters(**mcp_config))
-    read, write = await exit_stack.enter_async_context(stdio)
-    session = await exit_stack.enter_async_context(ClientSession(read, write))
-    await session.initialize()
-    tools = await session.list_tools()
+    # Handle environment
+    env = dict(mcp_config.get('env', {}))
+    if 'PATH' not in env:
+        env['PATH'] = os.environ.get('PATH', '')
 
-    return session, [{
+    params = StdioServerParameters(
+        command=mcp_config['command'],
+        args=mcp_config.get('args', []),
+        env=env
+    )
+
+    # Use exit_stack to manage cleanup
+    stdio = await exit_stack.enter_async_context(stdio_client(params))
+    session = await exit_stack.enter_async_context(ClientSession(*stdio))
+    await session.initialize()
+    logger.info(f'MCP session "{prefix}": initialized')
+    
+    tools = await session.list_tools()
+    tool_defs = [{
         "name": prefix + x.name,
         "description": x.description,
         "input_schema": x.inputSchema
     } for x in tools.tools]
 
+    return session, tool_defs
+
 async def query_get():
     session = PromptSession()
-    while True:
-        with patch_stdout():
-            prompt = await session.prompt_async('> ', prompt_continuation=lambda *a, **kw: "", multiline=True)
-
-            return prompt.strip()
+    with patch_stdout():
+        prompt = await session.prompt_async('> ', prompt_continuation=lambda *a, **kw: "", multiline=True)
+        return prompt.strip()
 
 async def app(mcp_configs):
     async with AsyncExitStack() as exit_stack:
+        # Initialize Anthropic client
         client = await exit_stack.enter_async_context(AsyncAnthropic())
-
+        
         tools, mcp_sessions = [], {}
-        for prefix, mcp_config in mcp_configs.items():
-            session, session_tools = await mcp_session_start(prefix + "__", mcp_config, exit_stack)
+        # Initialize sessions sequentially for stability
+        for prefix, config in mcp_configs.items():
+            session, tool_defs = await mcp_session_start(prefix + "__", config, exit_stack)
             mcp_sessions[prefix] = session
-            tools.extend(session_tools)
+            tools.extend(tool_defs)
+            logger.info(f'MCP session "{prefix}": ready with {len(tool_defs)} tools')
 
         try:
             messages = []
@@ -112,9 +125,12 @@ async def app(mcp_configs):
                 messages.append({"role": "user", "content": query})
                 messages = await llm(client, messages, tools, mcp_sessions)
                 print()
+        except KeyboardInterrupt:
+            logger.info("Received KeyboardInterrupt, shutting down...")
+            print("\nShutting down...")
         except Exception as e:
-            print("WHAT?", e)
-            logger.exception("NOP")
+            logger.exception("Error in main loop")
+            print(f"Error: {e}")
 
 def main():
     parser = argparse.ArgumentParser(
@@ -124,14 +140,9 @@ def main():
 
     with open(args.mcp_config_file) as f:
         mcp_configs = json.load(f)["mcpServers"]
-        for mcp_config in mcp_configs.values():
-            if "env" not in mcp_config:
-                mcp_config["env"] = {}
-            if "PATH" not in mcp_config["env"]:
-                mcp_config["env"]["PATH"] = os.environ["PATH"]
 
     try:
-        asyncio.run(app(mcp_configs), debug=True)
+        asyncio.run(app(mcp_configs))
     except KeyboardInterrupt:
         print("\nShutting down...")
     except Exception as e:
